@@ -6,7 +6,8 @@ import base64
 import datetime
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
-
+import openai
+from openai import OpenAI
 
 from ikapi import FileStorage, IKApi, setup_logging
 
@@ -25,7 +26,9 @@ class LegalEntityExtractor:
             # Pattern for cases with "and Another" or "& Anr."
             r'([A-Z][A-Za-z\s\.\,]+\s+(?:and|&)\s+(?:Another|Anr\.?|Ors\.?)\s+v\.?\s+[A-Z][A-Za-z\s\.\,]+)',
             # Pattern for cases with "and Others" or "& Ors."
-            r'([A-Z][A-Za-z\s\.\,]+\s+(?:and|&)\s+(?:Others|Ors\.?)\s+v\.?\s+[A-Z][A-Za-z\s\.\,]+)'
+            r'([A-Z][A-Za-z\s\.\,]+\s+(?:and|&)\s+(?:Others|Ors\.?)\s+v\.?\s+[A-Z][A-Za-z\s\.\,]+)',
+            # Pattern for "M Siddiq v. Mahant Suresh Das" style
+            r'([A-Z][A-Za-z\s\.\,]+\s*(?:\(D\))?\s*(?:Thr\s+Lrs\s+)?v[s]?\.?\s+[A-Z][A-Za-z\s\.\,]+)'
         ]
         
         # Comprehensive date patterns for Indian format
@@ -182,6 +185,9 @@ class CourtRoomAssistant:
         
         # Cache for documents we've already retrieved
         self.document_cache = {}
+        
+        # Initialize OpenAI client - using OPENAI_API_KEY instead of VITE_OPENAI_API_KEY
+        self.openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
     def process_speech(self, speech_text):
         """
@@ -212,7 +218,7 @@ class CourtRoomAssistant:
             
             if document_result["success"]:
                 # Generate a summary if document was found
-                document_result["summary"] = self.generate_summary(document_result["document_path"])
+                document_result["summary"] = self.generate_summary_with_rag(document_result["document_path"])
                 results.append(document_result)
             else:
                 results.append(document_result)
@@ -269,29 +275,40 @@ class CourtRoomAssistant:
                     f.write(jsonstr)
                 print(f"Document JSON saved to {json_path}")
                 
-                # Get original document if requested
+                # Get and save original document (PDF)
                 orig_path = None
-                if hasattr(self.ik_api, 'orig') and self.ik_api.orig:
-                    try:
-                        orig_doc = self.ik_api.fetch_orig_doc(doc_id)
-                        # Parse response and save original document
-                        orig_obj = json.loads(orig_doc)
-                        if 'errmsg' not in orig_obj:
-                            orig_content = base64.b64decode(orig_obj['doc'])
-                            extension = self.file_storage.get_file_extension(orig_obj['Content-Type'])
-                            orig_path = os.path.join(doc_dir, f"{doc_id}_original.{extension}")
-                            
-                            with open(orig_path, 'wb') as f:
+                pdf_path = None
+                try:
+                    print(f"Fetching original document for {doc_id}...")
+                    orig_doc = self.ik_api.fetch_orig_doc(doc_id)
+                    # Parse response and save original document
+                    orig_obj = json.loads(orig_doc)
+                    if 'errmsg' not in orig_obj:
+                        orig_content = base64.b64decode(orig_obj['doc'])
+                        extension = self.file_storage.get_file_extension(orig_obj['Content-Type'])
+                        orig_path = os.path.join(doc_dir, f"{doc_id}_original.{extension}")
+                        
+                        with open(orig_path, 'wb') as f:
+                            f.write(orig_content)
+                        print(f"Original document saved to {orig_path}")
+                        
+                        # If it's a PDF, create a copy with .pdf extension
+                        if extension == 'pdf':
+                            pdf_path = os.path.join(doc_dir, f"{doc_id}.pdf")
+                            with open(pdf_path, 'wb') as f:
                                 f.write(orig_content)
-                            print(f"Original document saved to {orig_path}")
-                    except Exception as e:
-                        print(f"Error saving original document: {str(e)}")
+                            print(f"PDF copy saved to {pdf_path}")
+                    else:
+                        print(f"Error getting original document: {orig_obj.get('errmsg', 'Unknown error')}")
+                except Exception as e:
+                    print(f"Error saving original document: {str(e)}")
                 
                 result = {
                     "success": True,
                     "document_id": doc_id,
                     "document_path": json_path,
                     "original_path": orig_path,
+                    "pdf_path": pdf_path,
                     "title": doc['title'],
                     "date": doc['publishdate'],
                     "source": doc['docsource']
@@ -313,20 +330,14 @@ class CourtRoomAssistant:
             print(error_msg)
             return {"success": False, "error": error_msg}
 
-    def generate_summary(self, document_path):
-        """
-        Generate a summary for a legal document
-        This is a simplified version - in a real system, you would use NLP techniques
-        """
+    def extract_document_content(self, document_path):
+        """Extract clean text content from legal document"""
         try:
             with open(document_path, 'r', encoding='utf-8') as f:
                 content = f.read()
                 doc_data = json.loads(content)
             
-            # Debug information about available keys
-            print(f"Document JSON keys: {list(doc_data.keys())}")
-            
-            # Indian Kanoon typically uses 'doc' field rather than 'doctext'
+            # Extract document content
             doc_content = None
             if 'doc' in doc_data:
                 doc_content = doc_data['doc']
@@ -334,87 +345,185 @@ class CourtRoomAssistant:
                 doc_content = doc_data['doctext']
             
             if doc_content:
-                # Remove HTML tags for better text processing
-                clean_text = re.sub(r'<[^>]+>', ' ', doc_content)
+                # Remove HTML tags
+                clean_text = re.sub(r'<[^>]+>', '\n', doc_content)
+                # Remove extra whitespace
+                clean_text = re.sub(r'\s+', ' ', clean_text)
+                # Remove excessive newlines
+                clean_text = re.sub(r'\n\s*\n', '\n\n', clean_text)
                 
-                # Split by paragraphs and get non-empty ones
-                paragraphs = [p.strip() for p in clean_text.split('\n\n') if p.strip()]
-                if not paragraphs and '\n' in clean_text:
-                    # Try different paragraph separator if needed
-                    paragraphs = [p.strip() for p in clean_text.split('\n') if p.strip()]
-                
-                # Get first few paragraphs for introduction (skip headers)
-                intro = ""
-                for p in paragraphs[:5]:
-                    if len(p) > 100:  # Skip short header paragraphs
-                        intro = p
-                        break
-                if not intro and paragraphs:
-                    intro = paragraphs[0]
-                
-                # Try to find the holding/conclusion
-                holding = ""
-                # Look for paragraphs with conclusion indicators
-                keywords = ["held", "holding", "conclude", "conclusion", "therefore", "judgment", "order", "directed", "decision"]
-                
-                for p in paragraphs:
-                    if any(keyword in p.lower() for keyword in keywords) and len(p) > 100:
-                        holding = p
-                        break
-                
-                # If no specific holding found, use the last substantial paragraph
-                if not holding:
-                    for p in reversed(paragraphs):
-                        if len(p) > 200:  # Look for a substantial paragraph
-                            holding = p
-                            break
-                
-                summary = {
-                    "introduction": intro[:500] + "..." if len(intro) > 500 else intro,
-                    "holding": holding[:500] + "..." if len(holding) > 500 else holding,
-                    "full_text_available": True,
-                    "length": len(paragraphs)
-                }
-                
-                return summary
+                return clean_text
             else:
-                # If we can't find the main text, look for title and extract what we can
-                summary_parts = {}
+                return f"Title: {doc_data.get('title', 'N/A')}\n\nDescription: {doc_data.get('desc', 'N/A')}"
                 
-                if 'title' in doc_data:
-                    summary_parts["title"] = doc_data['title']
+        except Exception as e:
+            print(f"Error extracting document content: {str(e)}")
+            return None
+
+    def chunk_document(self, text, max_chunk_size=1000):
+        """Split document into chunks for processing"""
+        # Split by paragraphs first
+        paragraphs = text.split('\n\n')
+        chunks = []
+        current_chunk = ""
+        
+        for paragraph in paragraphs:
+            # If adding this paragraph would exceed chunk size
+            if len(current_chunk) + len(paragraph) + 2 > max_chunk_size:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
                 
-                if 'desc' in doc_data:
-                    summary_parts["description"] = doc_data['desc']
-                
-                if summary_parts:
-                    summary_parts["note"] = "Limited summary available due to document structure"
-                    summary_parts["full_text_available"] = False
-                    return summary_parts
+                # If single paragraph is too long, split it by sentences
+                if len(paragraph) > max_chunk_size:
+                    sentences = paragraph.split('. ')
+                    current_chunk = ""
+                    for sentence in sentences:
+                        if len(current_chunk) + len(sentence) + 2 <= max_chunk_size:
+                            current_chunk += sentence + '. '
+                        else:
+                            if current_chunk:
+                                chunks.append(current_chunk.strip())
+                            current_chunk = sentence + '. '
                 else:
-                    return {"error": "Document format not recognized. Available fields: " + 
-                            ", ".join(list(doc_data.keys())), "full_text_available": False}
+                    current_chunk = paragraph
+            else:
+                current_chunk += paragraph + "\n\n"
+        
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+        
+        return chunks
+
+    def generate_summary_with_rag(self, document_path):
+        """Generate summary using RAG with OpenAI"""
+        try:
+            # Extract text from document
+            doc_text = self.extract_document_content(document_path)
+            if not doc_text:
+                return {"error": "Could not extract document content", "full_text_available": False}
+            
+            # Split into smaller chunks for processing
+            chunks = self.chunk_document(doc_text, max_chunk_size=800)
+            
+            # If document is very large, only process the first 3 chunks
+            if len(chunks) > 3:
+                print(f"Document has {len(chunks)} chunks. Processing first 3 for summary...")
+                chunks = chunks[:3]
+            
+            # Process chunks with OpenAI
+            summaries = []
+            key_findings = []
+            citations = []
+            legal_principles = []
+            
+            for i, chunk in enumerate(chunks):
+                print(f"Processing chunk {i+1}/{len(chunks)}")
+                
+                # Keep prompt short and concise
+                prompt = f"""Analyze this legal document excerpt and extract key information:
+
+{chunk[:1500]}
+
+Provide JSON:
+{{
+    "summary": "Key points in 1-2 sentences",
+    "principles": ["legal principle 1", "principle 2"],
+    "citations": ["citation 1"],
+    "findings": ["finding 1"]
+}}"""
+                
+                try:
+                    response = self.openai_client.chat.completions.create(
+                        model="gpt-3.5-turbo",
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.3,
+                        max_tokens=300
+                    )
+                    
+                    chunk_analysis = json.loads(response.choices[0].message.content)
+                    summaries.append(chunk_analysis.get("summary", ""))
+                    key_findings.extend(chunk_analysis.get("findings", []))
+                    citations.extend(chunk_analysis.get("citations", []))
+                    legal_principles.extend(chunk_analysis.get("principles", []))
+                    
+                except Exception as e:
+                    print(f"Error processing chunk: {str(e)}")
+                    continue
+            
+            # Generate final summary with a shorter prompt
+            combined_summary = " ".join(summaries)
+            combined_findings = list(set(key_findings))
+            combined_principles = list(set(legal_principles))
+            combined_citations = list(set(citations))
+            
+            final_prompt = f"""Create case summary from:
+Summary: {combined_summary[:500]}
+Findings: {", ".join(combined_findings[:5])}
+Principles: {", ".join(combined_principles[:3])}
+
+JSON format:
+{{
+    "title": "Case title",
+    "overview": "Brief overview",
+    "holding": "Court's decision",
+    "principles": ["key principle"],
+    "citations": ["citation"]
+}}"""
+            
+            try:
+                final_response = self.openai_client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[{"role": "user", "content": final_prompt}],
+                    temperature=0.3,
+                    max_tokens=500
+                )
+                
+                final_summary = json.loads(final_response.choices[0].message.content)
+                final_summary["full_text_available"] = True
+                final_summary["processing_chunks"] = len(chunks)
+                
+                return final_summary
+                
+            except Exception as e:
+                print(f"Error generating final summary: {str(e)}")
+                return {
+                    "overview": " ".join(summaries),
+                    "key_findings": combined_findings,
+                    "legal_principles": combined_principles,
+                    "citations": combined_citations,
+                    "full_text_available": False,
+                    "error": f"Final summary generation error: {str(e)}"
+                }
                 
         except Exception as e:
             import traceback
             trace = traceback.format_exc()
-            return {"error": f"Error generating summary: {str(e)}", 
-                    "traceback": trace,
-                    "full_text_available": False}
+            return {
+                "error": f"Error in RAG summarization: {str(e)}", 
+                "traceback": trace,
+                "full_text_available": False
+            }
 
 
 # Example usage
 if __name__ == "__main__":
-    # Your API token
-    
-# Instead of hardcoding: api_token = "b7fe8ba5eae65a5276a4560f1d7672c9f96e24e1"
+    # Load environment variables
     load_dotenv()
 
-# Get the API token from environment variables
-    api_token = os.environ.get("INDIAN_KANOON_API_TOKEN")
+    # Get API tokens from environment variables
+    indian_kanoon_token = os.environ.get("INDIAN_KANOON_API_TOKEN")
+    openai_api_key = os.environ.get("OPENAI_API_KEY")  # Changed from VITE_OPENAI_API_KEY
+    
+    if not indian_kanoon_token:
+        print("Error: INDIAN_KANOON_API_TOKEN not found in environment variables")
+        exit(1)
+    
+    if not openai_api_key:
+        print("Error: OPENAI_API_KEY not found in environment variables")
+        exit(1)
     
     # Initialize the assistant
-    assistant = CourtRoomAssistant(api_token)
+    assistant = CourtRoomAssistant(indian_kanoon_token)
     
     # You could get this from a speech recognition system in a real application
     speech_text = input("Enter court speech text: ")
@@ -443,10 +552,19 @@ if __name__ == "__main__":
                 print(f"Title: {doc_result['title']}")
                 print(f"Date: {doc_result['date']}")
                 print(f"Source: {doc_result['source']}")
-                print(f"Saved at: {doc_result['document_path']}")
+                print(f"JSON saved at: {doc_result['document_path']}")
+                
+                if 'pdf_path' in doc_result and doc_result['pdf_path']:
+                    print(f"PDF saved at: {doc_result['pdf_path']}")
+                elif 'original_path' in doc_result and doc_result['original_path']:
+                    print(f"Original file saved at: {doc_result['original_path']}")
+                else:
+                    print("No original document/PDF available")
                 
                 if "summary" in doc_result and doc_result["summary"]:
-                    print("\nSummary:")
+                    print("\n" + "="*50)
+                    print("CASE SUMMARY (Generated by GPT-3.5)")
+                    print("="*50)
                     
                     # Handle error in summary
                     if "error" in doc_result["summary"]:
@@ -454,11 +572,22 @@ if __name__ == "__main__":
                         if "traceback" in doc_result["summary"]:
                             print("Error details:")
                             print(doc_result["summary"]["traceback"])
-                    
-                    # Display available summary fields
-                    for key, value in doc_result["summary"].items():
-                        if key not in ["error", "traceback", "full_text_available"]:
-                            print(f"{key.capitalize()}: {value}")
+                    else:
+                        # Display structured summary
+                        if "title" in doc_result["summary"]:
+                            print(f"\nCASE TITLE: {doc_result['summary']['title']}")
+                        if "overview" in doc_result["summary"]:
+                            print(f"\nOVERVIEW: {doc_result['summary']['overview']}")
+                        if "holding" in doc_result["summary"]:
+                            print(f"\nHOLDING: {doc_result['summary']['holding']}")
+                        if "principles" in doc_result["summary"]:
+                            print(f"\nKEY PRINCIPLES:")
+                            for principle in doc_result["summary"]["principles"]:
+                                print(f"- {principle}")
+                        if "citations" in doc_result["summary"]:
+                            print(f"\nCITATIONS:")
+                            for citation in doc_result["summary"]["citations"]:
+                                print(f"- {citation}")
             else:
                 print(f"Error: {doc_result['error']}")
     
