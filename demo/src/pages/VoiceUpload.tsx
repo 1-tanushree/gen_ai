@@ -8,6 +8,7 @@ import { TextInput } from '../components/TextInput';
 import { ProcessingButton } from '../components/ProcessingButton';
 import { useAudioRecorder } from '../hooks/useAudioRecorder';
 import { transcribeAudio, analyzeText } from '../utils/openai';
+import { searchIndianKanoon } from '../utils/indianKanoon';
 
 function VoiceUpload() {
   const navigate = useNavigate();
@@ -115,7 +116,28 @@ function VoiceUpload() {
         throw new Error('No analysis result received');
       }
 
-      sessionStorage.setItem('documentSummary', analysisResult);
+      // Enrich citations and articles with Indian Kanoon links in parallel
+      const parsed = JSON.parse(analysisResult);
+
+      if (parsed.citations && Array.isArray(parsed.citations)) {
+        parsed.citations = await Promise.all(
+          parsed.citations.map(async (citation: { title: string; reference: string; relevance: string; link?: string; ikDocId?: number }) => {
+            const ikResult = await searchIndianKanoon(citation.title);
+            return ikResult ? { ...citation, link: ikResult.url, ikDocId: ikResult.docId } : citation;
+          })
+        );
+      }
+
+      if (parsed.articles && Array.isArray(parsed.articles)) {
+        parsed.articles = await Promise.all(
+          parsed.articles.map(async (article: { reference: string; exactText: string; plainExplanation: string; link?: string; ikDocId?: number }) => {
+            const ikResult = await searchIndianKanoon(article.reference);
+            return ikResult ? { ...article, link: ikResult.url, ikDocId: ikResult.docId } : article;
+          })
+        );
+      }
+
+      sessionStorage.setItem('documentSummary', JSON.stringify(parsed));
       navigate('/summary');
     } catch (error) {
       console.error('Processing error:', error);

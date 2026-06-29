@@ -1,2 +1,23 @@
-# .gitignore
+# Environment variables — contain API keys, never commit
 .env
+demo/.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Node / frontend
+demo/node_modules/
+demo/dist/
+demo/.vite/
+
+# Runtime-generated directories
+legal_documents/
+
+# Binary / media files
+sample.wav
+
+# OS files
+.DS_Store
+Thumbs.db
